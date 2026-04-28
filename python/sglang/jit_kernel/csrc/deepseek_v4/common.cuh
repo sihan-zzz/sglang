@@ -5,6 +5,13 @@
 
 #include <dlpack/dlpack.h>
 
+// SGLANG_HACK_DEBUG_PLAN_PREFILL: for [[unlikely]] dump on RuntimeCheck fail.
+// Use <iostream> not fprintf — typed `<<` is checked at compile time, so we
+// can't accidentally desync a format string from its 18 args.
+#include <iomanip>
+#include <iostream>
+#include <unistd.h>
+
 namespace host::compress {
 
 using PlanResult = tvm::ffi::Tuple<uint32_t, uint32_t>;
@@ -19,6 +26,90 @@ struct CompressParams {
   uint32_t compress_ratio;
   bool is_overlap;
 };
+
+// SGLANG_HACK_DEBUG_PLAN_PREFILL: dump full plan_prefill_host state on the
+// [[unlikely]] RuntimeCheck failure path.  Out-of-line so the hot loop stays
+// tiny; getting hit means we're already crashing.  Uses std::cerr instead of
+// fprintf because typed `<<` makes 18-arg "format string vs args" mismatches
+// impossible.
+inline void dump_plan_prefill_fail_state(
+    const CompressParams& params,
+    const bool use_cuda_graph,
+    const uint32_t ratio,
+    const uint32_t i,
+    const uint32_t seq_len,
+    const uint32_t extend_len,
+    const uint32_t prefix_len,
+    const uint32_t counter,
+    const uint32_t compress_counter,
+    const uint32_t write_counter) {
+  const auto& [
+      compress_ptr, write_ptr, seq_lens_ptr, extend_lens_ptr,
+      batch_size, num_tokens, compress_ratio, is_overlap
+  ] = params;
+
+  auto& os = std::cerr;
+  os << std::boolalpha;
+
+  os << "\n========== plan_prefill_host RuntimeCheck FAIL ==========\n"
+     << "[meta]\n"
+     << "  pid=" << getpid() << "  use_cuda_graph=" << use_cuda_graph << "\n"
+     << "[CompressParams - values]\n"
+     << "  batch_size=" << batch_size << "\n"
+     << "  num_tokens=" << num_tokens << "\n"
+     << "  compress_ratio=" << compress_ratio << "\n"
+     << "  is_overlap=" << is_overlap << "\n"
+     << "  derived ratio = compress_ratio * (1 + is_overlap) = " << ratio << "\n"
+     << "[CompressParams - pointer addresses]\n"
+     << "  compress_plan = " << static_cast<void*>(compress_ptr) << "\n"
+     << "  write_plan    = " << static_cast<void*>(write_ptr) << "\n"
+     << "  seq_lens      = " << static_cast<const void*>(seq_lens_ptr) << "\n"
+     << "  extend_lens   = " << static_cast<const void*>(extend_lens_ptr) << "\n"
+     << "[loop state at fail]\n"
+     << "  i (current batch index)          = " << i
+        << "  (of batch_size=" << batch_size << ")\n"
+     << "  seq_len                          = " << seq_len << "\n"
+     << "  extend_len                       = " << extend_len << "\n"
+     << "  prefix_len (= seq_len-extend_len, may underflow) = " << prefix_len << "\n"
+     << "  counter (running total)          = " << counter << "\n"
+     << "  compress_counter (running total) = " << compress_counter << "\n"
+     << "  write_counter (running total)    = " << write_counter << "\n";
+
+  os << "[full seq_lens / extend_lens table for ALL " << batch_size << " batches]\n"
+     << "  idx       seq_len    extend_len    prefix_len  note\n"
+     << "  ---  ------------  ------------  ------------  ----\n";
+  for (uint32_t k = 0; k < batch_size; ++k) {
+    const long long sl = static_cast<long long>(seq_lens_ptr[k]);
+    const long long el = static_cast<long long>(extend_lens_ptr[k]);
+    const long long pl = sl - el;
+    const bool bad = !(0 < el && el <= sl);
+    os << "  " << std::setw(3) << k
+       << "  " << std::setw(12) << sl
+       << "  " << std::setw(12) << el
+       << "  " << std::setw(12) << pl
+       << "  " << (bad ? "BAD " : "    ")
+       << (k == i ? "<<< FAIL HERE" : "") << "\n";
+  }
+
+  os << "[compress_plan written so far: indices 0.." << compress_counter << "]\n";
+  for (uint32_t k = 0; k < compress_counter; ++k) {
+    os << "  [" << std::setw(4) << k << "]"
+       << "  ragged_id=" << compress_ptr[k].ragged_id
+       << "  batch_id="  << compress_ptr[k].batch_id
+       << "  position="  << compress_ptr[k].position
+       << "  window_len="<< compress_ptr[k].window_len << "\n";
+  }
+  os << "[write_plan written so far: indices 0.." << write_counter << "]\n";
+  for (uint32_t k = 0; k < write_counter; ++k) {
+    os << "  [" << std::setw(4) << k << "]"
+       << "  ragged_id=" << write_ptr[k].ragged_id
+       << "  batch_id="  << write_ptr[k].batch_id
+       << "  position="  << write_ptr[k].position
+       << "  window_len="<< write_ptr[k].window_len << "\n";
+  }
+  os << "==========================================================\n"
+     << std::flush;
+}
 
 inline constexpr uint32_t kBlockSize = 1024;
 
@@ -110,6 +201,13 @@ inline PlanResult plan_prefill_host(const CompressParams& params, const bool use
     const uint32_t seq_len = seq_lens_ptr[i];
     const uint32_t extend_len = extend_lens_ptr[i];
     const uint32_t prefix_len = seq_len - extend_len;
+    // SGLANG_HACK_DEBUG_PLAN_PREFILL: dump full state on RuntimeCheck fail
+    if (!(0 < extend_len && extend_len <= seq_len)) [[unlikely]] {
+      dump_plan_prefill_fail_state(
+          params, use_cuda_graph, ratio,
+          i, seq_len, extend_len, prefix_len,
+          counter, compress_counter, write_counter);
+    }
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     /// NOTE: `start_write_pos` must be a multiple of `compress_ratio`
     const uint32_t start_write_pos = [seq_len, compress_ratio, is_overlap] {
