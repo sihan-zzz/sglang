@@ -70,11 +70,6 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
-# The flash_mla kernel rejects calls whose query-token count (q.shape[0])
-# exceeds this limit, so any prefill batch larger than this must be split
-# into multiple kernel invocations. See vLLM's split_prefill_chunks for the
-# analogous chunking in flashmla_sparse.
-FLASH_MLA_MAX_Q_TOKENS = 8192
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
@@ -139,52 +134,6 @@ def _create_flashmla_metadata():
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
-
-
-def _flash_mla_chunked_call(
-    *,
-    backend: str,
-    input_dict: Dict,
-    max_q_tokens: int = FLASH_MLA_MAX_Q_TOKENS,
-) -> torch.Tensor:
-    # Run the flash_mla prefill kernel, splitting along the query-token axis
-    # (q.shape[0]) when it exceeds `max_q_tokens`. Each chunk's per-token
-    # tensors are sliced independently because attention is sparse-per-token:
-    # every query token carries its own page indices / topk lengths.
-    #
-    # `tile_scheduler_metadata` is locked to `q.shape[0]` after first use
-    # (the kernel asserts sched_meta.config.b == q.shape[0]), so we allocate
-    # a fresh scheduler metadata buffer for each chunk.
-    q = input_dict["q"]
-    num_q_tokens = q.shape[0]
-    if num_q_tokens <= max_q_tokens:
-        return flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
-
-    per_token_keys = (
-        "q",
-        "indices",
-        "topk_length",
-        "extra_indices_in_kvcache",
-        "extra_topk_length",
-    )
-    chunk_outputs: List[torch.Tensor] = []
-    for chunk_start in range(0, num_q_tokens, max_q_tokens):
-        chunk_end = min(chunk_start + max_q_tokens, num_q_tokens)
-        chunk_dict = dict(input_dict)
-        for key in per_token_keys:
-            val = input_dict.get(key)
-            if val is None:
-                continue
-            assert val.shape[0] == num_q_tokens, (
-                f"flash_mla chunked call expects per-token tensor {key!r} "
-                f"to have shape[0]={num_q_tokens}, got {tuple(val.shape)}"
-            )
-            chunk_dict[key] = val[chunk_start:chunk_end]
-        chunk_dict["tile_scheduler_metadata"] = _create_flashmla_metadata()
-        chunk_outputs.append(
-            flash_mla_with_kvcache_entrypoint(**chunk_dict, backend=backend)[0]
-        )
-    return torch.cat(chunk_outputs, dim=0)
 
 
 @dataclass
@@ -1175,7 +1124,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             )
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-            o = _flash_mla_chunked_call(backend=backend, input_dict=input_dict)
+            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
             o = o.squeeze(1)
             return o

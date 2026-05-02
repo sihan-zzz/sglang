@@ -1070,10 +1070,10 @@ class ServerArgs:
         elif self.speculative_algorithm is None:
             # Normal case:
             capture_bs = (
-                [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14]
-                + list(range(16, 257, 4))
-                + list(range(272, 512, 8))
-                + list(range(512, self.cuda_graph_max_bs + 1, 16))
+                [1, 2, 4, 8, 12]
+                + list(range(16, 257, 8))
+                + list(range(272, 512, 16))
+                + list(range(512, self.cuda_graph_max_bs + 1, 32))
             )
         else:
             # Spec decoding case: less padding for smaller batch sizes
