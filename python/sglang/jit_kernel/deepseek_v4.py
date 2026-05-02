@@ -152,25 +152,6 @@ def _jit_compress_module(
 
 
 @cache_once
-def _jit_compress_module_v2_defensive(
-    head_dim: int,
-    dtype_in: torch.dtype,
-    dtype_out: torch.dtype,
-) -> Module:
-    args = make_cpp_args(head_dim, dtype_in, dtype_out, is_arch_support_pdl())
-    kernel_class = f"FlashCompress128Kernel<{args}>"
-    return load_jit(
-        make_name("compress_128_v2_defensive"),
-        *args,
-        cuda_files=["deepseek_v4/c128_v2.cuh"],
-        cuda_wrappers=[
-            ("prefill", f"{kernel_class}::run_prefill"),
-        ],
-        extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-@cache_once
 def _jit_rmsnorm_head_module(head_dim: int, dtype: torch.dtype):
     args = make_cpp_args(head_dim, dtype, is_arch_support_pdl())
     kernel_class = f"RMSNormKernel<{args}>"
@@ -225,6 +206,52 @@ def _jit_fused_store_module(
         *args,
         cuda_files=["deepseek_v4/store.cuh"],
         cuda_wrappers=[("run", f"{kernel_class}::run")],
+    )
+
+
+@cache_once
+def _jit_main_q_norm_rope_module(
+    dtype: torch.dtype, head_dim: int, rope_dim: int
+) -> Module:
+    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head)."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_norm_rope"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQNormRopeKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_main_k_norm_rope_flashmla_module(
+    dtype: torch.dtype, head_dim: int, rope_dim: int, page_size: int
+) -> Module:
+    """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_k_norm_rope_flashmla"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedKNormRopeFlashMLAKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype) -> Module:
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant (no norm)."""
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_quant"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward"),
+        ],
     )
 
 
@@ -616,24 +643,9 @@ def compress_forward(
         out.dtype,
         compress_ratio,
     )
-    if plan.is_decode:
-        F = module.decode
-    elif compress_ratio == 128 and _should_use_c128_prefill_defensive():
-        F = _jit_compress_module_v2_defensive(
-            head_dim,
-            kv_score_input.dtype,
-            out.dtype,
-        ).prefill
-    else:
-        F = module.prefill
+    F = module.decode if plan.is_decode else module.prefill
     F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
     return out
-
-
-def _should_use_c128_prefill_defensive() -> bool:
-    from sglang.srt.environ import envs
-
-    return envs.SGLANG_HANDLE_C128_PREFILL_KERNEL.get()
 
 
 def compress_fused_norm_rope_inplace(
@@ -676,7 +688,7 @@ def fused_norm_rope_inplace(
     )
 
 
-def fused_rope(
+def fused_rope_inplace(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
     freqs_cis: torch.Tensor,
@@ -686,6 +698,58 @@ def fused_rope(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
+
+
+def fused_q_norm_rope(
+    q_input: torch.Tensor,
+    q_output: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    head_dim = q_input.shape[-1]
+    rope_dim = freqs_real.shape[-1]
+    module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
+    module.forward(q_input, q_output, freqs_real, positions, eps)
+
+
+def fused_q_indexer_rope_hadamard_quant(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+    module.forward(
+        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
+    )
+    return q_fp8, weights_out
+
+
+def fused_k_norm_rope_flashmla(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    head_dim = kv.shape[-1]
+    rope_dim = freqs_real.shape[-1]
+    module = _jit_main_k_norm_rope_flashmla_module(
+        kv.dtype, head_dim, rope_dim, page_size
+    )
+    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
 
 
 @cache_once
@@ -848,142 +912,6 @@ def create_paged_compress_data_kernel(
         tl.store(base + 0 * stride_out_1_1, v0, mask=mask)
 
 
-_mmap_dumper = None
-
-
-def _get_mmap_dumper():
-    global _mmap_dumper
-    if _mmap_dumper is None:
-        from sglang.srt.debug_utils.mmap_dumper import MmapDumper
-        from sglang.srt.environ import envs
-
-        dump_dir = envs.SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA.get()
-        _mmap_dumper = MmapDumper(dump_dir or None)
-    return _mmap_dumper
-
-
-_dumped_static_meta_once = False
-
-
-def _maybe_dump_create_paged_compress_data_inputs(
-    *,
-    compress_ratio: int,
-    is_overlap: bool,
-    swa_page_size: int,
-    ring_size: int,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    extend_seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    full_to_swa_index_mapping: torch.Tensor,
-    block: int,
-) -> None:
-    d = _get_mmap_dumper()
-    if not d.is_active():
-        return
-
-    # Print static config (constant after server init) once per process.
-    global _dumped_static_meta_once
-    if not _dumped_static_meta_once:
-        print(
-            f"[c128_dump_static] swa_page_size={swa_page_size} ring_size={ring_size} "
-            f"block={block} req_to_token_shape={tuple(req_to_token.shape)} "
-            f"full_to_swa_shape={tuple(full_to_swa_index_mapping.shape)}",
-            flush=True,
-        )
-        _dumped_static_meta_once = True
-
-    # Per-ratio dump (small): req_pool_indices / seq_lens / extend_seq_lens.
-    # These are forward_batch fields, identical across c4 and c128 within the
-    # same forward — but small (KB-level) so dumping twice is cheap.
-    p = f"c{compress_ratio}_plan"
-    d.dump(
-        {
-            f"{p}_compress_ratio": compress_ratio,
-            f"{p}_is_overlap": is_overlap,
-            f"{p}_req_pool_indices": req_pool_indices,
-            f"{p}_seq_lens": seq_lens,
-            f"{p}_extend_seq_lens": extend_seq_lens,
-        }
-    )
-
-    # Global tensors shared between c4 and c128 (multi-MB-GB). Only dump on
-    # the first call per forward to avoid 2x GPU->CPU copy (~184 MB + ~33 MB).
-    # Backends call create_paged_compressor_data with c4 first, then c128
-    # (deepseek_v4_backend_radix.py:457-458), so dump on c4 only.
-    if compress_ratio == 4:
-        cols = min(10000, req_to_token.shape[1])
-        req_to_token_partial = req_to_token[:, :cols].contiguous()
-        d.dump(
-            {
-                "global_req_to_token_dumped_cols": cols,
-                "global_req_to_token_partial": req_to_token_partial,
-                "global_full_to_swa_index_mapping": full_to_swa_index_mapping,
-            }
-        )
-
-
-def _maybe_dump_create_paged_compress_data_outputs(
-    *,
-    compress_ratio: int,
-    out_0: torch.Tensor,
-    out_1: torch.Tensor,
-) -> None:
-    d = _get_mmap_dumper()
-    if not d.is_active():
-        return
-    p = f"c{compress_ratio}_plan"
-    d.dump(
-        {
-            f"{p}_out_0": out_0,
-            f"{p}_out_1": out_1,
-            f"{p}_out_0_shape": list(out_0.shape),
-            f"{p}_out_1_shape": list(out_1.shape),
-        }
-    )
-
-
-_printed_buffer_shape_once: dict = {}
-
-
-def maybe_dump_compress_metadata_extras(
-    *,
-    compress_ratio: int,
-    kv_score_buffer_shape: Tuple[int, ...],
-    kv_score_buffer_dtype: torch.dtype,
-    plan_compress_plan: torch.Tensor,
-    plan_write_plan: torch.Tensor,
-) -> None:
-    """Public helper to be called from compressor.py at metadata-prepare time
-    (once per forward per ratio, not per layer). Dumps the prefill kernel's
-    real bound (kv_score_buffer.shape) plus the actual plan tensors that get
-    fed to flash_c{ratio}_prefill.
-    """
-    d = _get_mmap_dumper()
-    if not d.is_active():
-        return
-
-    # Print kv_score_buffer.shape once per ratio (constant after init).
-    if compress_ratio not in _printed_buffer_shape_once:
-        print(
-            f"[c128_dump_static] c{compress_ratio} "
-            f"kv_score_buffer_shape={tuple(kv_score_buffer_shape)} "
-            f"dtype={kv_score_buffer_dtype}",
-            flush=True,
-        )
-        _printed_buffer_shape_once[compress_ratio] = True
-
-    p = f"c{compress_ratio}_meta"
-    d.dump(
-        {
-            f"{p}_plan_compress_plan": plan_compress_plan,
-            f"{p}_plan_write_plan": plan_write_plan,
-            f"{p}_plan_compress_count": int(plan_compress_plan.shape[0]),
-            f"{p}_plan_write_count": int(plan_write_plan.shape[0]),
-        }
-    )
-
-
 def triton_create_paged_compress_data(
     *,
     compress_ratio: int,
@@ -997,22 +925,6 @@ def triton_create_paged_compress_data(
     full_to_swa_index_mapping: torch.Tensor,
     block: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    _should_dump = bool(envs.SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA.get())
-    if _should_dump:
-        torch.cuda.synchronize()
-        _maybe_dump_create_paged_compress_data_inputs(
-            compress_ratio=compress_ratio,
-            is_overlap=is_overlap,
-            swa_page_size=swa_page_size,
-            ring_size=ring_size,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_seq_lens=extend_seq_lens,
-            req_to_token=req_to_token,
-            full_to_swa_index_mapping=full_to_swa_index_mapping,
-            block=block,
-        )
-
     batch_size = req_pool_indices.shape[0]
     out_dim = 4 if is_overlap else 1
     device_args: dict = dict(device=req_pool_indices.device, dtype=torch.int32)
@@ -1038,12 +950,6 @@ def triton_create_paged_compress_data(
         ring_size=ring_size,
         BLOCK=block,
     )
-
-    if _should_dump:
-        torch.cuda.synchronize()
-        _maybe_dump_create_paged_compress_data_outputs(
-            compress_ratio=compress_ratio, out_0=out_0, out_1=out_1
-        )
 
     if not is_overlap:
         out_1.squeeze_(1)
@@ -1128,9 +1034,10 @@ def silu_and_mul_contig_post_quant(
     transposed: bool = False,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    observe: bool = True,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
-    if apply_swiglu_limit:
+    if observe and apply_swiglu_limit:
         deepseek_v4_moe_code_path_checker.observed += 1
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
@@ -1175,12 +1082,14 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     return metadata
 
 
-def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:
+def rmsnorm_self(
+    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    out = q.new_empty(q.shape)
+    if out is None:
+        out = q.new_empty(q.shape)
     module.run_self(q, out, eps)
     return out
-
 
 
 def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
