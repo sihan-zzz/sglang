@@ -716,7 +716,10 @@ def _mask_topk_ids_padded_region(
     if num_token_non_padded is None:
         return
     if envs.SGLANG_OPT_USE_FAST_MASK_EP.get():
-        mask_topk_ids(topk_ids, num_token_non_padded)
+        mask_topk_ids_input = topk_ids.to(torch.int32)
+        mask_topk_ids(mask_topk_ids_input, num_token_non_padded)
+        if mask_topk_ids_input is not topk_ids:
+            topk_ids.copy_(mask_topk_ids_input)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = -1
