@@ -23,7 +23,13 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32, rmsnorm_self
+from sglang.jit_kernel.deepseek_v4 import (
+    fused_norm_rope_inplace,
+    fused_q_indexer_rope_hadamard_quant,
+    fused_q_norm_rope,
+    fused_rope_inplace,
+    linear_bf16_fp32,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
@@ -32,7 +38,6 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs, is_large_dummy_model
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
     assert_tensor_identical_across_cp_ranks,
     can_cp_split,
@@ -44,7 +49,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -229,7 +233,8 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[orders[0]], ape[orders[1]]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
+    # NOTE: used by v2 compressor backend
+    def get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
@@ -275,7 +280,7 @@ class Compressor(nn.Module):
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4BackendRadix)
-        kv_score_buffer = self._get_state_pool(forward_batch)
+        kv_score_buffer = self.get_state_pool(forward_batch)
         kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
         return backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
@@ -290,13 +295,8 @@ class Compressor(nn.Module):
             is_paged=True,
         )
 
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-        if forward_batch.forward_mode.is_idle():
-            assert x.shape[0] == 0
-            return x.new_empty(0, self.head_dim)
-
-        self.forward_mode = forward_batch.forward_mode
-
+    # NOTE: used by v2 compressor backend
+    def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
@@ -305,6 +305,14 @@ class Compressor(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+        return kv_score
+
+    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        kv_score = self.compute_kv_score(x, forward_batch)
         return self.compress_fused(kv_score, forward_batch)
 
 
@@ -361,17 +369,17 @@ class C4Indexer(nn.Module):
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
         self.alt_streams = alt_streams
 
-    def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def compute_q(
+        self,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        fused_rope(
-            q[..., -self.rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
+        return fused_q_indexer_rope_hadamard_quant(
+            q, weight, self.weight_scale, self.freqs_cis, positions
         )
-        q = rotate_activation(q)
-        return q
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
         out, _ = self.weights_proj(x)
@@ -623,8 +631,9 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
-        self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
+        # KV cache write is always fused into the K kernel
+        # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
+        # has no effect here -- the fused path is on by default.
 
     def _compute_q_a(
         self,
@@ -635,54 +644,68 @@ class MQALayer(nn.Module):
             q = qkv_a[..., : self.q_lora_rank]
         else:
             q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q_lora = q
-        return q_lora
+        return self.q_norm(q)
 
     def _compute_q_b(
         self,
         q: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
+        positions: torch.Tensor,
+        q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
-            q = rmsnorm_self(q, self.eps)
-        else:
-            q = rms_normalize_triton(q, self.eps)
-        if positions is not None:
-            fused_rope(
-                q[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
-        else:
-            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
-        return q
+        if q_out is None:
+            q_out = torch.empty_like(q)
+        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        return q_out
 
-    def _compute_kv(
+    def _compute_kv_to_cache(
         self,
         x: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         qkv_a: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> None:
+        """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
+
+        Replaces the bf16-kv-intermediate path. Used everywhere except the NSA
+        prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
+        """
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        kv = self.kv_norm(kv)
-        if positions is not None:
-            fused_rope(
-                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id,
+            raw_loc=forward_batch.out_cache_loc,
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=positions,
+        )
+
+    def _compute_kv_bf16(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        qkv_a: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
+        if qkv_a is not None:
+            kv = qkv_a[..., self.q_lora_rank :]
         else:
-            apply_rotary_emb_triton(kv[..., -self.qk_rope_head_dim :], self.freqs_cis)
+            kv, _ = self.wkv(x)
+        fused_norm_rope_inplace(
+            kv,
+            self.kv_norm.weight.data,
+            self.eps,
+            self.freqs_cis,
+            positions,
+        )
         return kv
 
     def _forward_prepare_multi_stream(
@@ -691,9 +714,8 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
-        freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -728,13 +750,8 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            kv = self._compute_kv(x, positions, freqs_cis, qkv_a=qkv_a)
-            if self.overlap_store_cache:
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+            # Fused norm + rope + cache write -- no bf16 KV intermediate.
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
 
         del qkv_a
 
@@ -744,15 +761,12 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, freqs_cis)
-        if q_out is not None:
-            q_out.copy_(q)
-
+        q = self._compute_q_b(q_lora, positions, q_out)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        return q, kv
+        return q
 
     def _forward_prepare(
         self,
@@ -760,36 +774,23 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
-        freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
-            q = qkv_a[..., : self.q_lora_rank]
-            kv = qkv_a[..., self.q_lora_rank :]
-            del qkv_a
+            q_lora = qkv_a[..., : self.q_lora_rank]
         else:
-            kv, _ = self.wkv(x)
-            q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q_lora = q
-        q, _ = self.wq_b(q)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
-            q = rmsnorm_self(q, self.eps)
-        else:
-            q = rms_normalize_triton(q, self.eps)
+            q_lora, _ = self.wq_a(x)
+            qkv_a = None
+        q_lora = self.q_norm(q_lora)
+        q = self._compute_q_b(q_lora, positions, q_out)
 
-        kv = self.kv_norm(kv)
-
-        fused_rope(
-            q[..., -self.qk_rope_head_dim :],
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
-        )
-
-        if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+        use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        kv: Optional[torch.Tensor]
+        if use_cp:
+            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
+            # write to the FlashMLA cache after gather.
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
@@ -802,13 +803,16 @@ class MQALayer(nn.Module):
                     tag=f"kv_after_allgather layer_id={self.layer_id}",
                     forward_batch=forward_batch,
                 )
-
-        if self.overlap_store_cache:
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
                 forward_batch=forward_batch,
             )
+        else:
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+            kv = None
+
+        del qkv_a
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -820,8 +824,6 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
-        if q_out is not None:
-            q_out.copy_(q)
         return q, kv
 
     def forward(
@@ -841,8 +843,6 @@ class MQALayer(nn.Module):
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4BackendRadix)
 
-        freqs_cis = None
-
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -859,26 +859,34 @@ class MQALayer(nn.Module):
             q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
-            q, kv = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+            # Multi-stream path always fuses cache write into the K kernel,
+            # so the bf16 KV intermediate is gone.
+            q = self._forward_prepare_multi_stream(
+                x, positions, forward_batch, attn_backend, q_out
             )
+            kv = None
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+                x, positions, forward_batch, attn_backend, q_out
             )
 
+        # The cache write is always fused / already done by _forward_prepare* --
+        # tell the backend to skip its own store_cache. When `kv is None`
+        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
+        # attention path doesn't read it once `save_kv_cache=False`.
+        attn_k = kv if kv is not None else q
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
-            k=kv,
-            v=kv,
+            k=attn_k,
+            v=attn_k,
             layer=self.attn_mqa,
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=not self.overlap_store_cache,
+            save_kv_cache=False,
         )
         o = o[:, tp_slice, :]
-        fused_rope(
+        fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
             self.freqs_cis,
@@ -1680,7 +1688,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if envs.SGLANG_DSV4_FP4_EXPERTS.get():
                     weights = _dequant_fp8_wo_a(weights)
                 else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                    weights = (
+                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
+                    )
                 # ------------------------------------------------------------------------
 
         stacked_params_mapping = [
